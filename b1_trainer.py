@@ -95,7 +95,7 @@ def create_dataloaders(X_train, y_train, X_val, y_val):
 
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE*2, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False
     )
     val_loader = DataLoader(
         val_dataset, batch_size=BATCH_SIZE * 2, shuffle=False,
@@ -120,7 +120,7 @@ class AttentionLayer(nn.Module):
 
 
 class AudioModel(nn.Module):
-    def __init__(self, input_dim=1, num_classes=2):
+    def __init__(self, num_classes=2):
         super(AudioModel, self).__init__()
 
         # CNN部分
@@ -157,11 +157,13 @@ class AudioModel(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, (nn.BatchNorm1d, nn.Linear)):
-                if hasattr(m, 'weight') and m.weight is not None:
-                    nn.init.normal_(m.weight, 0, 0.01)
-                if hasattr(m, 'bias') and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                # BN 层的 weight 必须初始化为 1，bias 初始化为 0
+                if hasattr(m, 'weight') and m.weight is not None: nn.init.constant_(m.weight, 1)
+                if hasattr(m, 'bias') and m.bias is not None: nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                if hasattr(m, 'weight') and m.weight is not None: nn.init.normal_(m.weight, 0, 0.01)
+                if hasattr(m, 'bias') and m.bias is not None: nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         if x.dim() == 2: x = x.unsqueeze(1)
@@ -377,11 +379,11 @@ if __name__ == '__main__':
     # 测试集
     test_data = np.load(test_path)
     X_test, y_test = test_data['features'], test_data['labels']
-    y_test_encode = le.fit_transform(y_test)
+    y_test_encode = le.transform(y_test)
     test_dataset = AudioDataset(X_test, y_test_encode)
     test_loader = DataLoader(
-        test_dataset, batch_size=BATCH_SIZE*2, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True
+        test_dataset, batch_size=BATCH_SIZE*2, shuffle=False,
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False
     )
 
     # 2. 模型

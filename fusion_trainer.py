@@ -7,7 +7,7 @@ from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix, precision_score,recall_score
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix, precision_score,recall_score,roc_curve,auc
 from tqdm import tqdm
 import time
 import sys
@@ -15,6 +15,7 @@ import librosa
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
+import pandas as pd
 
 warnings.filterwarnings('ignore')
 
@@ -70,7 +71,7 @@ class FusionDataset(Dataset):
         return audio_tensor, spec_tensor, label_b1
 
 
-def prepare_data(spec_info, test_info, sr=22050):
+def prepare_data(spec_info, test_info, sr=44100):
     print("\n[步骤1/6] 准备融合数据...")
     if not os.path.exists(spec_info):
         raise FileNotFoundError(f"未找到: {spec_info}")
@@ -84,7 +85,7 @@ def prepare_data(spec_info, test_info, sr=22050):
     test_data = np.load(test_info, allow_pickle=True)
     test_audios = torch.tensor(test_data['audio_array'],dtype=torch.float32)
     test_specs = torch.tensor(test_data['spec_array'],dtype=torch.float32)
-    test_labels = le.fit_transform(test_data['labels'])
+    test_labels = le.transform(test_data['labels'])
 
     # 划分索引
     train_idx, val_idx = train_test_split(
@@ -117,15 +118,15 @@ def prepare_data(spec_info, test_info, sr=22050):
     print('\n[步骤2/6]创建dataloader...')
     train_dl = DataLoader(
         FusionDataset(b1_train, b2_train), batch_size=BATCH_SIZE,
-        shuffle=True, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True
+        shuffle=True, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False
     )
     val_dl = DataLoader(
         FusionDataset(b1_val, b2_val), batch_size=BATCH_SIZE * 2,
-        shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY
+        shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False
     )
     test_dl = DataLoader(
         FusionDataset(b1_test, b2_test), batch_size=BATCH_SIZE * 2,
-        shuffle=True, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY
+        shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False
     )
     return train_dl, val_dl, test_dl, le
 
@@ -171,8 +172,7 @@ class SpecBranch(nn.Module):
             nn.Conv2d(3, 16, 3, 1, 1), nn.BatchNorm2d(16), nn.ReLU(), nn.Dropout2d(DROPOUT_RATE / 2), nn.MaxPool2d(2),
             nn.Conv2d(16, 32, 3, 1, 1), nn.BatchNorm2d(32), nn.ReLU(), nn.Dropout2d(DROPOUT_RATE / 2), nn.MaxPool2d(2),
             nn.Conv2d(32, 64, 3, 1, 1), nn.BatchNorm2d(64), nn.ReLU(), nn.Dropout2d(DROPOUT_RATE / 2), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, 1, 1), nn.BatchNorm2d(128), nn.ReLU(), nn.Dropout2d(DROPOUT_RATE / 2),
-            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, 1, 1), nn.BatchNorm2d(128), nn.ReLU(), nn.Dropout2d(DROPOUT_RATE / 2), nn.MaxPool2d(2),
         )
         self.pool = nn.AdaptiveAvgPool2d((8, None))
         self.lstm = nn.LSTM(128, 64, num_layers=2, batch_first=True, bidirectional=True, dropout=DROPOUT_RATE)
@@ -231,7 +231,8 @@ class GatedFusion(nn.Module):
         # C. 加权融合 (Weighted Fusion)
         # 公式: H = z * H_audio + (1 - z) * H_spec
         # 如果 z 接近 1，模型主要看 Audio；如果 z 接近 0，主要看 Spectrum
-        fused_feat = z * h_audio + (1 - z) * h_spec
+        gated_fused = z * h_audio + (1 - z) * h_spec
+        fused_feat = gated_fused + 0.5*(h_audio+h_spec)
 
         return fused_feat
 
@@ -244,6 +245,7 @@ class JointFusionModel(nn.Module):
         self.fusion = GatedFusion(dim=128)
         self.classifier = nn.Sequential(
             nn.Linear(128,64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Dropout(DROPOUT_RATE),
             nn.Linear(64,num_classes),
@@ -255,16 +257,24 @@ class JointFusionModel(nn.Module):
         for m in self.modules():
             if isinstance(m, (nn.Conv1d, nn.Conv2d)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.Linear)):
+            elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                # BN 层的 weight 必须初始化为 1，bias 初始化为 0
+                if hasattr(m, 'weight') and m.weight is not None: nn.init.constant_(m.weight, 1)
+                if hasattr(m, 'bias') and m.bias is not None: nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
                 if hasattr(m, 'weight') and m.weight is not None: nn.init.normal_(m.weight, 0, 0.01)
                 if hasattr(m, 'bias') and m.bias is not None: nn.init.constant_(m.bias, 0)
 
     def forward(self, a, s):
+        raw_audio = torch.flatten(a,1)
         fa = self.audio(a)
         fs = self.spec(s)
         fused=self.fusion(fa,fs)
-        return self.classifier(fused)
+        return self.classifier(fused), raw_audio, fa, fs, fused
 
+def count_parameters(model):
+    """计算模型可训练参数量"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 # ====================== 4. 训练核心 ======================
 def train_model(model, train_loader, val_loader, criterion, optimizer):
@@ -293,7 +303,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer):
             a, s, y = a.to(DEVICE), s.to(DEVICE), y.to(DEVICE)
 
             with autocast(enabled=scaler is not None):
-                out = model(a, s)
+                out, *features = model(a, s)
                 loss = criterion(out, y) / GRADIENT_ACCUMULATION_STEPS
 
             if scaler:
@@ -325,7 +335,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer):
         with torch.no_grad():
             for a, s, y in val_loader:
                 a, s, y = a.to(DEVICE), s.to(DEVICE), y.to(DEVICE)
-                out = model(a, s)
+                out, *features = model(a, s)
                 loss = criterion(out, y)
                 v_loss += loss.item() * a.size(0)
                 _, p = torch.max(out, 1)
@@ -402,12 +412,17 @@ def plot_results(history):
 def evaluate(model, loader, class_names):
     print('\n[步骤6/6]最终评价...')
     model.eval()
-    preds, targets = [], []
+    preds, targets, probs_list = [], [], []
     with torch.no_grad():
         for a, s, y in loader:
             a, s, y = a.to(DEVICE), s.to(DEVICE), y.to(DEVICE)
             with torch.amp.autocast(device_type='cuda'):
-                out = model(a, s)
+                out, *feature = model(a, s)
+
+                # 【增加】：通过 Softmax 提取正类（索引 1）的概率
+                probs = torch.softmax(out, dim=1)[:, 1]
+                probs_list.extend(probs.cpu().numpy())
+
                 _, p = torch.max(out, 1)
                 preds.extend(p.cpu().numpy())
                 targets.extend(y.cpu().numpy())
@@ -433,6 +448,152 @@ def evaluate(model, loader, class_names):
     plt.savefig(os.path.join(FUSION_DIR, 'fusion_cm.png'))
     plt.close()
 
+    # ================= 增加：绘制 ROC 曲线 =================
+    print('  正在绘制并保存独立测试集 ROC 曲线...')
+    fpr, tpr, _ = roc_curve(targets, probs_list)
+    roc_auc = auc(fpr, tpr)
+    df = pd.DataFrame({'fpr': fpr, 'tpr': tpr,'auc':roc_auc})
+    path = os.path.join(FUSION_DIR,"roc_data.csv")
+    df.to_csv(path, index=False)
+
+    plt.figure(figsize=(6, 5), dpi=300)
+    plt.plot(fpr, tpr, color='#d62728', lw=2.5, label=f'M-CRNN ROC Curve (AUC = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], color='gray', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate', fontweight='bold', fontsize=14)
+    plt.ylabel('True Positive Rate', fontweight='bold', fontsize=14)
+    plt.title('M-CRNN ROC Curve', fontweight='bold', fontsize=16)
+    plt.legend(loc="lower right", prop={'size': 12, 'weight': 'bold'})
+    plt.grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout(pad=0.5)
+    roc_path = os.path.join(FUSION_DIR, 'fusion_roc_curve.png')
+    plt.savefig(roc_path, bbox_inches='tight', pad_inches=0.05, facecolor='white')
+    plt.close()
+
+    # 【可选】：如果想把 AUC 也写进 txt，可以在写入时附加上
+    with open(os.path.join(FUSION_DIR, 'fusion_metrics.txt'), 'a', encoding='utf-8') as f:
+        f.write(f"\nAUC Score: {roc_auc:.4f}\n")
+
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+from tqdm import tqdm
+
+
+def visualize_gated_tsne(model, dataloader, device, save_dir, max_samples_per_class=1000):
+    """
+    符合 Automation in Construction 标准的 t-SNE 独立可视化脚本。
+    包含：独立子图、封闭坐标轴、t-SNE维度标注、高DPI、Times New Roman及自动降采样。
+
+    参数:
+        max_samples_per_class: 每个类别的最大可视化样本数，防止 overplotting。
+    """
+    model.eval()
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    feats_dict = {
+        'Raw_Input': [],
+        'Branch1': [],
+        'Branch2': [],
+        'Gated_Fusion': [],
+        'Final_Logits': []
+    }
+    all_labels = []
+
+    # 1. 特征提取阶段
+    with torch.no_grad():
+        for audio, spec, labels in tqdm(dataloader, desc="Extracting Features"):
+            audio, spec = audio.to(device), spec.to(device)
+            # 确保 model 返回顺序与此一致
+            logits, raw, f1, f2, fused = model(audio, spec)
+
+            feats_dict['Raw_Input'].extend(raw.cpu().numpy())
+            feats_dict['Branch1'].extend(f1.cpu().numpy())
+            feats_dict['Branch2'].extend(f2.cpu().numpy())
+            feats_dict['Gated_Fusion'].extend(fused.cpu().numpy())
+            feats_dict['Final_Logits'].extend(logits.cpu().numpy())
+            all_labels.extend(labels.numpy())
+
+    all_labels = np.array(all_labels)
+
+    # 2. 全局样式与期刊规范配置
+    plt.rcParams['font.family'] = 'Times New Roman'
+    # 类别设定：1-Solid (蓝色), 0-Hollow (红色)
+    class_names = ['Hollow', 'Solid']
+    colors = ['#FF0000', '#0000FF']
+
+    TITLE_SIZE = 24
+    LABEL_SIZE = 22
+    LEGEND_SIZE = 18
+
+    # 3. 独立降维与渲染
+    for i, (name, val) in enumerate(feats_dict.items()):
+        print(f" -> Processing {name} via t-SNE...")
+
+        # 降维计算
+        tsne = TSNE(n_components=2, perplexity=30, init='pca', random_state=42)
+        data_2d = tsne.fit_transform(np.array(val))
+
+        # 创建独立画布，保证高分辨率
+        fig, ax = plt.subplots(figsize=(8, 7), dpi=600)
+
+        for label_idx in range(len(class_names)):
+            # 提取当前类的所有索引
+            idx = np.where(all_labels == label_idx)[0]
+
+            # 降采样机制：避免过度堆叠
+            if len(idx) > max_samples_per_class:
+                np.random.seed(42)  # 保证每次运行抽样一致
+                idx = np.random.choice(idx, max_samples_per_class, replace=False)
+
+            ax.scatter(
+                data_2d[idx, 0], data_2d[idx, 1],
+                c=colors[label_idx],
+                label=class_names[label_idx],
+                alpha=0.65,  # 调整透明度以显示密度
+                s=45,  # 增大尺寸
+                edgecolors='white',
+                linewidths=0.4
+            )
+
+        # 标题格式化，例如: (a) Raw Input
+        # ax.set_title(f"({chr(97 + i)}) {name.replace('_', ' ')}",
+        #              fontweight='bold', fontsize=TITLE_SIZE, pad=15)
+
+        # 坐标轴标签设置
+        ax.set_xlabel("t-SNE dimension 1", fontsize=LABEL_SIZE, fontname='Times New Roman')
+        ax.set_ylabel("t-SNE dimension 2", fontsize=LABEL_SIZE, fontname='Times New Roman')
+
+        # 保留封闭边框，仅隐藏内部刻度数值和短线
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(1.5)  # 加粗边框线以适应大图
+
+        # 图例配置
+        ax.legend(
+            loc='lower right',
+            prop={'size': LEGEND_SIZE, 'family': 'Times New Roman'},
+            frameon=True,
+            edgecolor='black',
+            fancybox=False
+        )
+
+        # 保存图像
+        file_name = f"tsne_{i + 1}_{name}.png"
+        save_path = os.path.join(save_dir, file_name)
+        plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1)
+        plt.close()
+        print(f" ✅ Saved: {save_path}")
+
+    print(f"\n[完成] 所有特征阶段的流形图已按照期刊标准独立保存至: {save_dir}")
+
 
 # ====================== 主程序 ======================
 if __name__ == '__main__':
@@ -445,12 +606,14 @@ if __name__ == '__main__':
     # 2. 模型
     print('\n[步骤3/6]初始化模型...')
     model = JointFusionModel(num_classes=2)
+    params = count_parameters(model)
 
     # 3. 优化
     criterion = nn.CrossEntropyLoss(label_smoothing=0.15).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, amsgrad=True)
 
     # 4. 运行
+    print(f"\n🚀 开始训练 Fusion_model对比模型 | 参数量: {params:,}")
     hist, path = train_model(model, train_dl, val_dl, criterion, optimizer)
 
     # 5. 结果
@@ -459,3 +622,9 @@ if __name__ == '__main__':
     evaluate(model, test_dl, le.classes_)
     print("\nFusion 训练结束！")
     print(f"程序结束时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+    # 6. 特征解耦可视化
+    print('\n[步骤6/6] 生成特征流形可视化 (t-SNE)...')
+    model.load_state_dict(torch.load(os.path.join(FUSION_DIR, 'best_fusion_model.pth')))
+    visualize_gated_tsne(model, test_dl, DEVICE, FUSION_DIR)

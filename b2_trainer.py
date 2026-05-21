@@ -148,7 +148,7 @@ def create_dataloaders(img_paths, img_array, labels):
         shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=PIN_MEMORY,
-        drop_last=True,
+        drop_last=False,
         prefetch_factor=2 if NUM_WORKERS > 0 else None,
         persistent_workers=True if NUM_WORKERS > 0 else False)  # 提升稳定性)
 
@@ -743,12 +743,12 @@ if __name__ == "__main__":
     y_encoded = le.fit_transform(final_labels)
     train_loader, val_loader = create_dataloaders(final_img_paths, final_img_array, y_encoded)
 
-    y_test_encode = le.fit_transform(test_labels)
+    y_test_encode = le.transform(test_labels)
     test_dataset = AudioDataset(test_merged_array, y_test_encode)
     test_loader = DataLoader(
         test_dataset,
         batch_size=BATCH_SIZE * 2,
-        shuffle=True,
+        shuffle=False,
         num_workers=0,
         pin_memory=PIN_MEMORY,
         drop_last=False)
